@@ -16,26 +16,35 @@ export default async function handler(req, res) {
   }
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "web-search-2025-03-05",
-      },
-      body: JSON.stringify({
-        model: req.body.model,
-        max_tokens: req.body.max_tokens,
-        system: req.body.system,
-        tools: req.body.tools,
-        messages: req.body.messages,
-      }),
+    const { messages, system } = req.body;
+
+    // Convert messages format for Gemini
+    const contents = messages.map(m => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: typeof m.content === "string" ? m.content : m.content[0]?.text || "" }]
+    }));
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system_instruction: system ? { parts: [{ text: system }] } : undefined,
+          contents,
+          generationConfig: { maxOutputTokens: 1000 },
+        }),
+      }
+    );
+
+    const data = await response.json();
+    
+    // Convert Gemini response to Anthropic format
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return res.status(200).json({
+      content: [{ type: "text", text }]
     });
 
-    const text = await response.text();
-    res.setHeader("Content-Type", "application/json");
-    return res.status(response.status).send(text);
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
