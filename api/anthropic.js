@@ -2,22 +2,31 @@ export const config = {
   api: { bodyParser: true },
 };
 
-const GOOGLE_KEY = process.env.GOOGLE_SEARCH_KEY;
-const GOOGLE_CX = process.env.GOOGLE_SEARCH_CX;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const ADZUNA_ID = process.env.ADZUNA_APP_ID;
+const ADZUNA_KEY = process.env.ADZUNA_APP_KEY;
 
-async function googleSearch(query) {
-  const url = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_KEY}&cx=${GOOGLE_CX}&q=${encodeURIComponent(query)}&num=10`;
+async function searchAdzuna(query, country) {
+  const params = new URLSearchParams({
+    app_id: ADZUNA_ID,
+    app_key: ADZUNA_KEY,
+    results_per_page: 20,
+    what: query,
+    content_type: "application/json",
+  });
+  const url = `https://api.adzuna.com/v1/api/jobs/${country}/search/1?${params}`;
   const res = await fetch(url);
   const data = await res.json();
-  if (data.error) {
-    console.error("Google error:", JSON.stringify(data.error));
-    return [];
-  }
-  return (data.items || []).map(item => ({
-    title: item.title,
-    link: item.link,
-    snippet: item.snippet,
+  if (data.exception) { console.error("Adzuna error:", data.exception); return []; }
+  return (data.results || []).map(j => ({
+    id: j.id,
+    title: j.title,
+    company: j.company?.display_name || "Unknown",
+    location: j.location?.display_name || "Remote",
+    description: j.description?.slice(0, 300) || "",
+    url: j.redirect_url || "",
+    created: j.created || new Date().toISOString(),
+    salary: j.salary_min ? `$${Math.round(j.salary_min/1000)}k-$${Math.round((j.salary_max||j.salary_min)/1000)}k` : null,
   }));
 }
 
@@ -35,7 +44,7 @@ async function gemini(prompt) {
   );
   const data = await res.json();
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  console.log("Gemini returned:", text.slice(0, 200));
+  console.log("Gemini length:", text.length, "preview:", text.slice(0, 100));
   return text;
 }
 
@@ -48,64 +57,84 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const { system, messages } = req.body;
+    const { messages } = req.body;
     const userMsg = typeof messages?.[0]?.content === "string"
       ? messages[0].content
       : messages?.[0]?.content?.[0]?.text || "";
 
-    console.log("Request type detection, userMsg start:", userMsg.slice(0, 100));
-
     // Cover letter
-    if (userMsg.toLowerCase().includes("cover letter") || userMsg.toLowerCase().includes("write a 3-paragraph")) {
+    if (userMsg.includes("cover letter") || userMsg.includes("Write a 3-paragraph")) {
       const text = await gemini(userMsg);
       return res.status(200).json({ content: [{ type: "text", text }] });
     }
 
-    // Job search — always treat as job search and read type from system or message
-    const isProduct = system?.includes("product_manager") || userMsg.includes("product_manager") ||
-      (system?.includes("Product Manager") && !system?.includes("Project Manager"));
+    // Job type
+    const isProduct = userMsg.includes("product_manager") ||
+      (userMsg.includes("Product Manager") && !userMsg.includes("Project Manager"));
     const roleType = isProduct ? "product_manager" : "project_manager";
     const roleLabel = isProduct ? "Product Manager" : "Project Manager";
 
-    console.log("Searching for:", roleLabel);
+    // Already seen companies from frontend
+    const seenMatch = userMsg.match(/EXCLUDE_COMPANIES:\[(.*?)\]/);
+    const excludedCompanies = seenMatch
+      ? seenMatch[1].split(",").map(s => s.trim().toLowerCase()).filter(Boolean)
+      : [];
 
-    // Google search
-    let allResults = [];
+    console.log("Searching:", roleLabel, "| Excluding:", excludedCompanies.length, "companies");
+
+    // Adzuna search
+    let allJobs = [];
     try {
-      const r1 = await googleSearch(`"${roleLabel}" remote job 2025 2026`);
-      const r2 = await googleSearch(`${roleLabel} remote hiring international company`);
-      allResults = [...r1, ...r2];
-      // deduplicate
-      const seen = new Set();
-      allResults = allResults.filter(r => { if(seen.has(r.link)) return false; seen.add(r.link); return true; });
-      console.log("Google results:", allResults.length);
+      const [gbJobs, usJobs] = await Promise.all([
+        searchAdzuna(`${roleLabel} remote`, "gb"),
+        searchAdzuna(`${roleLabel} remote`, "us"),
+      ]);
+      allJobs = [...gbJobs, ...usJobs];
+
+      // Deduplicate by company, exclude already seen
+      const seen = new Set(excludedCompanies);
+      allJobs = allJobs.filter(j => {
+        const key = j.company.toLowerCase().trim();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      console.log("Adzuna unique new results:", allJobs.length);
     } catch(e) {
-      console.error("Google search failed:", e.message);
+      console.error("Adzuna failed:", e.message);
     }
 
-    const searchContext = allResults.slice(0, 15).map((r, i) =>
-      `[${i+1}] ${r.title}\nURL: ${r.link}\nDescription: ${r.snippet}`
-    ).join("\n\n");
+    const jobsContext = allJobs.length > 0
+      ? allJobs.slice(0, 20).map((j, i) =>
+          `${i+1}. "${j.title}" at ${j.company} | ${j.location}${j.salary ? " | " + j.salary : ""} | Posted: ${j.created?.slice(0,10) || "recent"}\n   ${j.description}\n   URL: ${j.url}`
+        ).join("\n\n")
+      : `No Adzuna results. Use remote-friendly companies NOT in this list: [${excludedCompanies.join(", ")}]. Pick from: ${isProduct ? "Miro, Hotjar, Intercom, Typeform, Linear, Loom, Contentful, Prezly, Doist, Buffer, Help Scout, Airtable, Pitch, Coda, Notion" : "GitLab, Automattic, Deel, Remote.com, Toggl, Zapier, Productboard, ClickUp, Asana, monday.com, Brex, Pleo, Personio, Leapsome"}.`;
 
-    const prompt = `You are a job search assistant. Find 8 remote ${roleLabel} job openings for this candidate.
+    const today = new Date().toISOString().slice(0, 10);
 
-CANDIDATE: Daria Kalinina, ${roleLabel}, Yerevan Armenia, open to remote. 4+ years PM, 9+ years tech. AI SaaS founder (6000 users), PM at OZON.ru, PM at systeme.io Ireland (English, 500k users), Lead PjM at Zvuk/Sber. Skills: Figma, Jira, SQL, Python, Tableau, Amplitude, Scrum. English B2/C1.
+    const prompt = `Select the best 8 remote ${roleLabel} jobs for this candidate from the listings below.
 
-REAL SEARCH RESULTS:
-${searchContext || "No results - use your knowledge of remote companies"}
+CANDIDATE: Daria Kalinina, ${roleLabel}, Yerevan Armenia, open to remote. 4+ yrs PM, 9+ yrs tech. AI SaaS founder (6k users), PM OZON.ru, PM systeme.io Ireland (English, 500k users), Lead PjM Zvuk/Sber (10 engineers, Python/K8s/GitLab). Figma, Jira, SQL, Python, Tableau, Amplitude, Scrum. English B2/C1.
 
-INSTRUCTIONS: Create a JSON array of 8 ${roleLabel} jobs. Use real companies from search results when possible. Fill gaps with well-known remote-friendly companies (GitLab, Miro, Automattic, Doist, Hotjar, Intercom, Typeform, Linear, Loom, Contentful, Deel, Buffer, Help Scout, Prezly).
+JOB LISTINGS:
+${jobsContext}
 
-RESPOND WITH ONLY THIS JSON ARRAY, NO OTHER TEXT:
-[{"id":"1","company":"GitLab","role":"Senior ${roleLabel}","type":"${roleType}","location":"Remote (Worldwide)","description":"Own roadmap for DevOps features. Work with distributed engineering teams.","email":"jobs@gitlab.com","url":"https://about.gitlab.com/jobs/","matchScore":90,"matchReason":"Fully remote company matching Daria's cross-functional delivery experience"}]
+Respond with ONLY a JSON array. No markdown. No backticks. Start with [ end with ]:
+[{"id":"1","company":"Name","role":"Title","type":"${roleType}","location":"Remote (Region)","description":"2 sentences about the role.","email":"careers@company.com","url":"https://...","matchScore":85,"matchReason":"Specific reason for Daria","postedDate":"${today}"}]
 
-RULES: exactly 8 items, all unique companies, type="${roleType}" for ALL, matchScore 70-95, no markdown, no backticks, pure JSON array only.`;
+RULES:
+- Exactly 8 jobs
+- All unique companies  
+- type="${roleType}" for ALL entries
+- matchScore 70-95
+- postedDate: use real date from listings when available, otherwise use today "${today}"
+- Use real Adzuna URLs when available`;
 
     const text = await gemini(prompt);
     return res.status(200).json({ content: [{ type: "text", text }] });
 
   } catch (error) {
-    console.error("Handler error:", error.message);
+    console.error("Error:", error.message);
     return res.status(500).json({ error: error.message });
   }
 }
