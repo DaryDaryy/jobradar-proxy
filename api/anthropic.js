@@ -24,11 +24,18 @@ export default async function handler(req, res) {
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "web-search-2025-03-05",
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify({
+        model: req.body.model,
+        max_tokens: req.body.max_tokens,
+        system: req.body.system,
+        tools: req.body.tools,
+        messages: req.body.messages,
+      }),
     });
 
-    const data = await response.json();
-    return res.status(response.status).json(data);
+    const text = await response.text();
+    res.setHeader("Content-Type", "application/json");
+    return res.status(response.status).send(text);
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
